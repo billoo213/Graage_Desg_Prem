@@ -1,0 +1,120 @@
+name: Build MON GARAGE APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle dependencies
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Check Flutter
+        run: flutter --version
+
+      - name: Generate Android project
+        run: flutter create . --platforms=android
+
+      - name: Remove generated starter tests
+        run: rm -rf test
+
+      - name: Configure Android notifications and desugaring
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          gradle_files = [Path('android/app/build.gradle.kts'), Path('android/app/build.gradle')]
+          gradle = next((p for p in gradle_files if p.exists()), None)
+          if gradle is None:
+              sys.exit('Gradle app file not found')
+
+          text = gradle.read_text()
+          kotlin = gradle.suffix == '.kts'
+          enabled = 'isCoreLibraryDesugaringEnabled = true' if kotlin else 'coreLibraryDesugaringEnabled true'
+          dependency = ('coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
+                        if kotlin else "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'")
+
+          if enabled not in text:
+              match = re.search(r'compileOptions\s*\{', text)
+              if not match:
+                  sys.exit('compileOptions block not found in ' + str(gradle))
+              pos = match.end()
+              text = text[:pos] + '\n        ' + enabled + text[pos:]
+
+          if dependency not in text:
+              match = re.search(r'dependencies\s*\{', text)
+              if match:
+                  pos = match.end()
+                  text = text[:pos] + '\n    ' + dependency + text[pos:]
+              else:
+                  text += '\n\ndependencies {\n    ' + dependency + '\n}\n'
+          gradle.write_text(text)
+
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          if not manifest.exists():
+              sys.exit('AndroidManifest.xml not found')
+          xml = manifest.read_text()
+          if 'android.permission.RECEIVE_BOOT_COMPLETED' not in xml:
+              xml = xml.replace('<manifest', '<manifest\n    xmlns:android="http://schemas.android.com/apk/res/android"', 1) if 'xmlns:android=' not in xml else xml
+              xml = xml.replace('<application', '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />\n    <application', 1)
+          if 'ScheduledNotificationReceiver' not in xml:
+              receivers = '''\n        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />\n        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">\n            <intent-filter>\n                <action android:name="android.intent.action.BOOT_COMPLETED"/>\n                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>\n                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>\n            </intent-filter>\n        </receiver>\n'''
+              xml = xml.replace('</application>', receivers + '    </application>')
+          manifest.write_text(xml)
+          print('Configured:', gradle, 'and', manifest)
+          PY
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze Flutter code
+        run: flutter analyze --no-fatal-infos
+
+      - name: Build release APK (retry on Maven rate limits)
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            echo "Release build attempt ${attempt}/3"
+            if flutter build apk --release; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              wait_seconds=$((attempt * 45))
+              echo "Build failed. Waiting ${wait_seconds}s before retry..."
+              sleep "$wait_seconds"
+            fi
+          done
+          echo "Release build failed after 3 attempts. Check the first Gradle error above."
+          exit 1
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MON-GARAGE-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
